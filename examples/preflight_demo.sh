@@ -4,6 +4,8 @@
 # 预检只读：不生成修订、变化记录或断言，原状态不变。
 # 输入沿用正式批次的 expected_revision / operations，
 # 额外给出 extra_retraction_budget（0～3，默认可撤回的生效旧证据数上限）。
+# 临时保全与正式批次同一口径：直接撤回受保全证据按 409 EVIDENCE_HELD 拒绝，
+# 额外撤回建议排除受保全证据（见第 8 节）。
 #
 # 前提：服务已启动（docker compose up --build），监听 http://localhost:8000
 set -euo pipefail
@@ -118,7 +120,60 @@ curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d
     {\"op\": \"assert\", \"evidence_id\": \"PN-9\", \"stratum_a\": \"A1\", \"stratum_b\": \"A2\", \"relation\": \"same_period\"}
   ]}" | pp
 
-echo; echo "== 8. 确认预检全程只读：修订号仍为 $REV，PN-* 证据均未入库 =="
+echo; echo "== 8. 临时保全联动：受保全证据不进额外撤回建议，直接撤回按 EVIDENCE_HELD 拒绝 =="
+echo "-- 8a. 对 PV-1（A1~A2 同一期，闭环上字典序最小的旧证据）建立保全；保全不递增修订 --"
+HOLD1="$(curl -s -X POST "$BASE/evidence-holds" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"evidence_ids\": [\"PV-1\"],
+  \"reason\": \"预检演示：PV-1 交接复核存疑\"}")"
+echo "$HOLD1" | pp
+HOLD1_ID="$(echo "$HOLD1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+HOLD1_CRED="$(echo "$HOLD1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"])')"
+curl -s "$BASE/revision" | pp
+
+echo "-- 8b. 预检直接撤回受保全的 PV-1 -> 409 EVIDENCE_HELD（与正式批次同构，附 blocked_evidence） --"
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"operations\": [
+    {\"op\": \"retract\", \"evidence_id\": \"PV-1\"}
+  ]}" | pp
+
+echo "-- 8c. 同一冲突批次（PN-2: A4<A1）预算 1：建议改为 PV-2（排除受保全的 PV-1） --"
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"extra_retraction_budget\": 1,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"PN-2\", \"stratum_a\": \"A4\", \"stratum_b\": \"A1\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+
+echo "-- 8d. 再保全 PV-2、PV-3：闭环上旧证据全部受保全 -> budget_insufficient（附冲突路径） --"
+HOLD2="$(curl -s -X POST "$BASE/evidence-holds" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"evidence_ids\": [\"PV-2\", \"PV-3\"],
+  \"reason\": \"预检演示：PV-2/PV-3 一并保全\"}")"
+HOLD2_ID="$(echo "$HOLD2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+HOLD2_CRED="$(echo "$HOLD2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"])')"
+echo "$HOLD2" | pp
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"extra_retraction_budget\": 1,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"PN-2\", \"stratum_a\": \"A4\", \"stratum_b\": \"A1\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+
+echo "-- 8e. 解除全部保全（不递增修订）后，同一预检恢复建议字典序最小的 PV-1 --"
+curl -s -X POST "$BASE/evidence-holds/$HOLD1_ID/release" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV, \"credential\": \"$HOLD1_CRED\"}" | pp
+curl -s -X POST "$BASE/evidence-holds/$HOLD2_ID/release" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV, \"credential\": \"$HOLD2_CRED\"}" | pp
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"extra_retraction_budget\": 1,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"PN-2\", \"stratum_a\": \"A4\", \"stratum_b\": \"A1\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+
+echo; echo "== 9. 确认预检全程只读：修订号仍为 $REV，PN-* 证据均未入库，保全均已解除 =="
 curl -s "$BASE/revision" | pp
 curl -s "$BASE/assertions?status=active" | python3 -c '
 import sys, json
@@ -128,5 +183,12 @@ print("active assertions:", [r["evidence_id"] for r in rows])
 print("leaked preflight evidence:", leaked)
 assert not leaked, leaked
 print("预检验据无泄漏（只读成立）")'
+curl -s "$BASE/evidence-holds" | python3 -c '
+import sys, json
+rows = json.load(sys.stdin)
+demo = [h for h in rows if h["reason"].startswith("预检演示")]
+print("demo holds:", [(h["id"], h["status"]) for h in demo])
+assert demo and all(h["status"] == "released" for h in demo), demo
+print("演示保全均已解除（保全不递增修订）")'
 
 echo; echo "全部预检示例执行完毕（正式状态未被预检修改）。"

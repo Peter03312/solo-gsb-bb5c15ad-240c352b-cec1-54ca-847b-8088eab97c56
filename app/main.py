@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.12.0",
+    version="1.13.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -39,6 +39,9 @@ app = FastAPI(
         "支持只读证据撤回承受力分析（/resilience/retraction-analysis）："
         "在同一正式视图中求让指定两层关系变为未定所需撤回的最少生效证据"
         "（受保护证据不可撤回；替代路径仍成立不判失效；同一期双向连通按一条证据计数）；"
+        "支持提交前只读预检（/batches/preflight）：按正式批次语义重放新增与撤回，"
+        "在预算（0～3）内求消除冲突所需的最少额外旧证据撤回"
+        "（受临时保全覆盖的证据不可作为建议；直接撤回受保全证据按正式批次的 EVIDENCE_HELD 拒绝）；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
@@ -126,6 +129,11 @@ def post_batch_preflight(batch: PreflightIn):
     再在 extra_retraction_budget（0～3）限定的生效旧证据范围内，寻找不含本批
     新增证据、也不重复本批撤回的最少额外撤回集合（并列按证据编号序列字典序最小）；
     修订号过期、证据编号占用、撤回目标无效等沿用正式批次的拒绝语义。
+
+    临时保全与正式批次同一口径（生效保全在同一快照视图内读取）：
+    本批直接撤回受保全证据按 409 EVIDENCE_HELD 拒绝（details 附 blocked_evidence）；
+    额外撤回搜索排除受保全证据，对其余生效旧证据仍按数量最少、编号序列字典序最小
+    选解，预算内无解返回 budget_insufficient 与冲突路径。
 
     返回 resolution：
     - `already_consistent`：原批次本可通过，额外撤回集合为空，passed=true；

@@ -10,6 +10,9 @@
 - 撤回拦截（`assert_evidence_not_held`）：普通正式批次、野外包勘误与推演并入中
   凡将受保全覆盖的生效证据撤回到正式库的操作整笔拒绝，返回命中的证据与保全记录；
   正式修订、台账与推演状态均不变。推演内试验撤回不经正式库，不受限制。
+  提交前预检（只读）沿用同一拦截：直接撤回受保全证据按正式批次的
+  409 EVIDENCE_HELD 拒绝，并以 `active_held_evidence_ids` 把受保全证据排除在
+  额外撤回建议之外。
 
 并发裁决：保全建立 / 解除与正式写入一样，事务内先锁修订计数器行
 （`revision_counter ... FOR UPDATE`），全部操作按取得该锁的同一全序裁决；
@@ -70,6 +73,25 @@ def _active_holds_map(cur, evidence_ids: Sequence[str]) -> Dict[str, List[Dict[s
     for evidence_id, *hold_row in cur.fetchall():
         result.setdefault(evidence_id, []).append(_hold_summary(hold_row))
     return result
+
+
+def active_held_evidence_ids(cur, evidence_ids: Iterable[str]) -> set:
+    """给定证据编号中当前仍被生效保全覆盖的子集（在调用方事务视图内读取）。
+
+    只读路径（如提交前预检）用它把受保全证据排除在“建议撤回”候选之外；
+    与 _active_holds_map 同一口径，只取编号、不展开保全明细。
+    """
+    ids = sorted(set(e for e in evidence_ids if e))
+    if not ids:
+        return set()
+    cur.execute(
+        "SELECT DISTINCT i.evidence_id "
+        "FROM evidence_hold_items i "
+        "JOIN evidence_holds h ON h.id = i.hold_id "
+        "WHERE i.evidence_id = ANY(%s) AND h.status = 'active'",
+        (ids,),
+    )
+    return {r[0] for r in cur.fetchall()}
 
 
 def assert_evidence_not_held(

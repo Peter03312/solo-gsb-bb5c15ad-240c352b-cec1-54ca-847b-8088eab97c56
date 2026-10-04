@@ -5,11 +5,19 @@
 **完全相同的顺序与语义**重放全部结构性校验（修订号、地层、编号占用、撤回目标），
 但不写库、不递增修订号、不产生变化记录或任何其他副作用。
 
+临时保全与正式批次同一口径（生效保全在同一快照视图内读取，结果以读取时状态为准）：
+
+- 本批**直接撤回**受生效保全覆盖的证据：按正式批次的 409 EVIDENCE_HELD 拒绝，
+  details 同样给出 blocked_evidence（命中证据及其全部生效保全记录）；
+- 搜索**额外撤回**时把受保全证据排除在候选之外——否则照建议提交会被正式批次
+  以 EVIDENCE_HELD 拒绝；对其余生效旧证据仍按撤回数最少、并列编号序列字典序
+  最小选解，预算内无解仍返回 budget_insufficient 与冲突路径。
+
 对按原批次语义处理新增与撤回后的视图做关系核验：
 
 - 无冲突（本批次本可直接通过）：额外撤回集合为空，passed=true；
-- 仍冲突：在“处理后视图中仍生效、且由历史批次引入”的旧证据中寻找额外撤回集合——
-  既不包含本批新增证据，也不与本批撤回目标重复：
+- 仍冲突：在“处理后视图中仍生效、由历史批次引入且未被保全”的旧证据中寻找
+  额外撤回集合——既不包含本批新增证据，也不与本批撤回目标重复：
   - 撤回数最少（0..budget），并列时取证据编号序列字典序最小的一组；
   - 本批最终保留的新断言自身矛盾（仅凭新断言之间就构成组内早于/早于闭环）：
     无法靠撤回旧证据修复（resolution=unfixable_new_assertions）；
@@ -25,6 +33,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 from .db import db_conn
 from .derivation import Assertion, Derivation
 from .errors import ApiError
+from .holds import active_held_evidence_ids, assert_evidence_not_held
 from .models import AssertOp, PreflightIn, RetractOp
 
 # 预算硬上限（与模型字段约束保持一致；搜索复杂度随该值指数级增长）
@@ -128,7 +137,23 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 r[0]: (r[1], r[2], r[3], r[4], r[5]) for r in rows
             }
 
-            # 3) 按正式批次的操作顺序逐条重放结构性校验（命中即按相同错误码拒绝）。
+            # 3) 临时保全拦截：与正式批次同一位置（修订号校验之后、逐条重放之前）、
+            #    同一拒绝语义——本批撤回目标中任一证据仍被生效保全覆盖，即按正式批次的
+            #    409 EVIDENCE_HELD 拒绝，details 附 blocked_evidence（命中证据及其
+            #    全部生效保全记录）。只读快照事务内取不到也不必取计数器行锁：
+            #    预检结果以读取时状态为准，不写入任何状态。
+            retract_targets = [
+                op.evidence_id for op in batch.operations if isinstance(op, RetractOp)
+            ]
+            assert_evidence_not_held(
+                cur,
+                retract_targets,
+                code="EVIDENCE_HELD",
+                message="批次撤回目标中存在受临时保全覆盖的证据，整批拒绝，原状态不变",
+                extra={"expected_revision": batch.expected_revision},
+            )
+
+            # 4) 按正式批次的操作顺序逐条重放结构性校验（命中即按相同错误码拒绝）。
             #    重放只在内存中维护断言状态，绝不执行 INSERT/UPDATE。
             # 本批新增（证据编号 -> 断言），含同批“新增后又撤回”
             new_assertions: Dict[str, Assertion] = {}
@@ -208,7 +233,7 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                         batch_retract_ids.add(eid)
                         status_by_id[eid] = "retracted"
 
-            # 4) 组装“按原批次语义处理新增与撤回后”的生效断言视图
+            # 5) 组装“按原批次语义处理新增与撤回后”的生效断言视图
             after_assertions: List[Assertion] = []
             for eid, (a, b, relation, _status, _rev) in historical_by_id.items():
                 if status_by_id[eid] == "active":
@@ -227,7 +252,7 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 "batch_retracted_evidence": sorted(batch_retract_ids),
             }
 
-            # 5a) 原批次本可通过：空集合
+            # 6a) 原批次本可通过：空集合
             if not conflicts:
                 common.update(
                     {
@@ -240,7 +265,7 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 )
                 return common
 
-            # 5b) 本批最终保留的新断言自身矛盾？——仅凭新断言之间核验
+            # 6b) 本批最终保留的新断言自身矛盾？——仅凭新断言之间核验
             retained_new = [a for eid, a in new_assertions.items() if eid not in retracted_new]
             if Derivation(retained_new).validate():
                 common.update(
@@ -254,12 +279,17 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 )
                 return common
 
-            # 5c) 在可额外撤回的旧证据中搜索最少集合：
-            #     处理后视图仍生效的历史证据，且不在本批撤回目标中（不含本批新增证据）
+            # 6c) 在可额外撤回的旧证据中搜索最少集合：
+            #     处理后视图仍生效的历史证据，且不在本批撤回目标中（不含本批新增证据）；
+            #     受生效保全覆盖的证据同样排除——建议撤回它们会被正式批次以
+            #     EVIDENCE_HELD 拒绝（保全在同一快照视图内读取）。
+            held_ids = active_held_evidence_ids(cur, (a.evidence_id for a in after_assertions))
             candidates = frozenset(
                 a.evidence_id
                 for a in after_assertions
-                if a.evidence_id not in batch_new_ids and a.evidence_id not in batch_retract_ids
+                if a.evidence_id not in batch_new_ids
+                and a.evidence_id not in batch_retract_ids
+                and a.evidence_id not in held_ids
             )
             result = search_minimum_extra_retractions(after_assertions, candidates, budget)
             if result is not None:
@@ -276,7 +306,7 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 )
                 return common
 
-            # 5d) 预算内无解
+            # 6d) 预算内无解
             common.update(
                 {
                     "resolution": "budget_insufficient",
