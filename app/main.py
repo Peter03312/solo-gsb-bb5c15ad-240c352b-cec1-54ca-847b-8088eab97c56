@@ -127,6 +127,11 @@ def post_batch_preflight(batch: PreflightIn):
     新增证据、也不重复本批撤回的最少额外撤回集合（并列按证据编号序列字典序最小）；
     修订号过期、证据编号占用、撤回目标无效等沿用正式批次的拒绝语义。
 
+    临时保全与正式批次同一视图、同一口径：请求直接撤回的目标命中生效保全时按
+    409 EVIDENCE_HELD 拒绝（details.blocked_evidence 同正式批次）；额外撤回搜索
+    自动排除受保全证据——只给出正式批次确实能撤回的旧证据。保全以读取时刻的
+    只读快照为准，不递增修订、不写入任何状态。
+
     返回 resolution：
     - `already_consistent`：原批次本可通过，额外撤回集合为空，passed=true；
     - `extra_retractions_found`：给出最少额外撤回集合及应用后是否通过核验；

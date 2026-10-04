@@ -2,14 +2,22 @@
 
 输入沿用正式批次的 expected_revision / operations，并指定可额外撤回的生效旧证据
 数上限（0～3）。预检全程只读：在 REPEATABLE READ READ ONLY 快照事务内按正式批次
-**完全相同的顺序与语义**重放全部结构性校验（修订号、地层、编号占用、撤回目标），
-但不写库、不递增修订号、不产生变化记录或任何其他副作用。
+**完全相同的顺序与语义**重放全部结构性校验（修订号、保全拦截、地层、编号占用、
+撤回目标），但不写库、不递增修订号、不产生变化记录或任何其他副作用。
+
+临时保全（与正式批次同一保全视图、同一拒绝口径）：
+
+- 请求直接撤回的目标中任一证据在读取时刻仍被生效保全覆盖时，沿用正式批次的
+  409 EVIDENCE_HELD 整笔拒绝（details.blocked_evidence 列出命中证据及其全部
+  生效保全），不进入后续核验——照此提交正式批次必然被同一理由拒绝；
+- 搜索额外撤回时**排除所有受生效保全覆盖的旧证据**：保全证据不可能通过正式
+  批次撤回，把它们计入建议只会产生“预检通过、正式批次 EVIDENCE_HELD”的假阳性。
 
 对按原批次语义处理新增与撤回后的视图做关系核验：
 
 - 无冲突（本批次本可直接通过）：额外撤回集合为空，passed=true；
-- 仍冲突：在“处理后视图中仍生效、且由历史批次引入”的旧证据中寻找额外撤回集合——
-  既不包含本批新增证据，也不与本批撤回目标重复：
+- 仍冲突：在“处理后视图中仍生效、由历史批次引入、且未被生效保全覆盖”的旧证据
+  中寻找额外撤回集合——既不包含本批新增证据，也不与本批撤回目标重复：
   - 撤回数最少（0..budget），并列时取证据编号序列字典序最小的一组；
   - 本批最终保留的新断言自身矛盾（仅凭新断言之间就构成组内早于/早于闭环）：
     无法靠撤回旧证据修复（resolution=unfixable_new_assertions）；
@@ -17,6 +25,8 @@
 
 unfixable / budget_insufficient 两种情况均附“处理后视图（未做额外撤回）”中
 仍存在的冲突证据路径，与正式批次的 CONFLICT.details.conflicts 同构。
+
+保全状态以只读快照读取时刻为准；保全不递增正式修订，预检结果也不写入任何状态。
 """
 from __future__ import annotations
 
@@ -25,6 +35,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 from .db import db_conn
 from .derivation import Assertion, Derivation
 from .errors import ApiError
+from .holds import active_held_evidence, assert_evidence_not_held
 from .models import AssertOp, PreflightIn, RetractOp
 
 # 预算硬上限（与模型字段约束保持一致；搜索复杂度随该值指数级增长）
@@ -114,6 +125,21 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
             # 1) 修订号（只读查询，不加 FOR UPDATE：预检不得阻塞或干扰正式批次）
             _raise_stale(cur, batch.expected_revision)
 
+            # 1b) 临时保全拦截：裁决位置与正式批次一致（修订号之后、结构性校验
+            #     之前）。撤回目标中任一证据在读取时刻仍被生效保全覆盖，即沿用
+            #     正式批次完全相同的 409 EVIDENCE_HELD（含 blocked_evidence 详情）
+            #     整笔拒绝——修订号已核验相等，故此处预期号即当前号。
+            retract_targets = [
+                op.evidence_id for op in batch.operations if isinstance(op, RetractOp)
+            ]
+            assert_evidence_not_held(
+                cur,
+                retract_targets,
+                code="EVIDENCE_HELD",
+                message="批次撤回目标中存在受临时保全覆盖的证据，整批拒绝，原状态不变",
+                extra={"expected_revision": batch.expected_revision},
+            )
+
             # 2) 加载该正式视图：已登记地层、全部断言行（含状态与所属修订）
             cur.execute("SELECT stratum_id FROM strata")
             strata = {r[0] for r in cur.fetchall()}
@@ -122,6 +148,10 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 "FROM assertions"
             )
             rows = cur.fetchall()
+            # 读取时刻仍被生效保全覆盖的证据（同一只读快照，与正式批次同表同语义）：
+            # 直接撤回命中者已在上面拦截；额外撤回搜索还须排除这些证据——它们无法
+            # 通过正式批次撤回，不应出现在任何“可执行”的额外撤回建议中。
+            held_ids = active_held_evidence(cur, [r[0] for r in rows if r[4] == "active"])
             # status_by_id 仅含历史断言；本批新增编号在重放过程中动态加入
             status_by_id: Dict[str, str] = {r[0]: r[4] for r in rows}
             historical_by_id: Dict[str, Tuple[str, str, str, str, int]] = {
@@ -255,11 +285,15 @@ def preflight_batch(batch: PreflightIn) -> Dict[str, Any]:
                 return common
 
             # 5c) 在可额外撤回的旧证据中搜索最少集合：
-            #     处理后视图仍生效的历史证据，且不在本批撤回目标中（不含本批新增证据）
+            #     处理后视图仍生效的历史证据，不在本批撤回目标中（不含本批新增证据），
+            #     且读取时刻未被生效保全覆盖（受保全证据不可能被正式批次撤回，
+            #     必须排除，否则会给出正式批次无法执行的假阳性建议）。
             candidates = frozenset(
                 a.evidence_id
                 for a in after_assertions
-                if a.evidence_id not in batch_new_ids and a.evidence_id not in batch_retract_ids
+                if a.evidence_id not in batch_new_ids
+                and a.evidence_id not in batch_retract_ids
+                and a.evidence_id not in held_ids
             )
             result = search_minimum_extra_retractions(after_assertions, candidates, budget)
             if result is not None:

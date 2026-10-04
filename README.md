@@ -31,8 +31,10 @@
 - **提交前预检（只读）**：`POST /batches/preflight` 输入沿用正式批次的 `expected_revision`、
   `operations`，并指定可额外撤回的生效旧证据数上限 `extra_retraction_budget`（0～3）。在该
   修订号对应的同一正式视图中先按原批次语义处理新增与撤回，再寻找**不包含本批新增证据、也不
-  重复本批撤回**的额外撤回集合：撤回数最少、并列时按证据编号序列字典序最小，返回该集合与
-  应用后是否通过关系核验。预检**不生成修订、变化记录或断言**，正式批次请求与返回格式不变。
+  重复本批撤回、且未被生效临时保全覆盖**的额外撤回集合：撤回数最少、并列时按证据编号序列
+  字典序最小，返回该集合与应用后是否通过关系核验。直接撤回受保全证据时预检沿用正式批次的
+  409 `EVIDENCE_HELD`（含 `blocked_evidence` 详情）。预检**不生成修订、变化记录或断言**，
+  正式批次请求与返回格式不变。
 - **分期试排（只读）**：`POST /periodization/arrangement`（正式）与
   `POST /projections/{id}/periodization/arrangement`（推演冻结视图，含已关闭推演）输入
   视图对应的 `expected_revision`、总期数 `total_periods`（1～64）及可选地层期位锚点
@@ -186,6 +188,7 @@
 | 路径 | 拒绝码 |
 | --- | --- |
 | `POST /batches`（普通批次撤回归档） | 409 `EVIDENCE_HELD` |
+| `POST /batches/preflight`（提交前只读预检的直接撤回目标命中保全） | 409 `EVIDENCE_HELD` |
 | `POST /field-packages/corrections`（勘误撤回原包证据） | 409 `FIELD_PACKAGE_EVIDENCE_HELD` |
 | `POST /projections/{id}/merge`（并入撤回基线证据） | 409 `MERGE_EVIDENCE_HELD` |
 
@@ -193,6 +196,8 @@
   `[{"evidence_id": "EV-002", "holds": [{"id": 7, "revision": 3, "reason": "…", "created_at": "…"}]}]`，
   并附 `blocked_evidence_ids` 与 `current_revision`；整笔拒绝意味着同批中未受保的
   其他撤回也不生效，**正式修订、断言、包台账与推演状态全部不变**。
+  预检的 `EVIDENCE_HELD` 为只读拒绝（不写任何状态）；此外预检计算额外撤回建议时会
+  自动排除受保全证据，保证给出的建议照搬到正式批次不会再被 `EVIDENCE_HELD` 拦截。
   **推演内试验撤回**（`POST /projections/{id}/batches`）不写正式库，仍可进行；
   其并入尝试会被 `MERGE_EVIDENCE_HELD` 拦截、推演保持 open。
 - **多份保全覆盖同一证据须全部解除**：每份保全有独立凭据，只有覆盖该证据的全部
@@ -261,7 +266,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/evidence-holds/evidence/{evidence_id}` | 按证据编号反查：是否在保全中、生效保全数与全部生效保全来源 |
 | POST | `/evidence-holds/{id}/release` | 凭对应凭据解除指定保全（错误凭据 403；不递增修订） |
 | GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 野外汇入包台账列表 / 详情（内容指纹与首次响应；已替换包带 status/替换链；终端或包号含 `/` 等路径保留字符时用 `/field-packages?terminal_id=...&package_no=...`） |
-| POST | `/batches/preflight` | 提交前只读预检：求消除冲突所需撤回的最少生效旧证据（预算 0～3），不落库 |
+| POST | `/batches/preflight` | 提交前只读预检：求消除冲突所需撤回的最少生效旧证据（预算 0～3，自动排除受保全证据，直接撤回受保全证据按 EVIDENCE_HELD 拒绝），不落库 |
 | GET | `/revision` | 当前修订号 |
 | GET | `/assertions?status=active` | 断言列表 |
 | GET | `/revision-changes?limit=100&cursor=...` | 游标分页追踪各正式修订前后关系/最优路径变化 |
@@ -333,6 +338,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `extra_retraction_budget`：可额外撤回的**生效旧证据**数上限，取 `0`～`3`，默认 `0`。
 - 处理顺序：在该修订号对应的**同一正式视图**中先按原批次语义处理本批新增与撤回（含同批
   “新增后又撤回”按最终不保留处理），再在旧证据中求额外撤回集合；
+- **临时保全联动（与正式批次同视图、同口径）**：
+  - 请求直接撤回的目标中任一证据在读取时刻仍被生效保全覆盖时，预检在与正式批次相同的
+    裁决位置（修订号之后、结构性校验之前）返回 **409 `EVIDENCE_HELD`**，`details` 的
+    `blocked_evidence` / `blocked_evidence_ids` 与正式批次完全同构——该批照原样提交必然
+    被正式批次以同一理由拒绝；
+  - 搜索额外撤回时**自动排除所有受生效保全覆盖的旧证据**：保全证据无法经正式批次撤回，
+    不会出现在 `extra_retractions` 中。受保全证据是唯一解法时按 `budget_insufficient`
+    返回（附冲突路径），提示先解除相应保全或另行取证；保全解除后再次预检即可重新纳入候选；
 - 额外撤回集合**不包含本批新增证据**、也**不重复本批撤回目标**，只从“处理后仍生效的历史
   证据”中选取；
 - 选取规则：撤回数最少（0～预算）；并列时按**证据编号序列字典序最小**（同一期边与早于边
@@ -340,8 +353,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 修订号过期、证据编号占用（含已撤回编号、同批重复）、撤回目标无效（不存在 / 已撤回 /
   同批重复撤回）、引用未登记地层等**全部沿用正式批次的拒绝语义与错误码**。
 
-预检**只读**（在 `REPEATABLE READ READ ONLY` 快照事务内完成），不生成修订、变化记录或
-断言，正式批次的既有请求与返回格式均未改变。
+预检**只读**（在 `REPEATABLE READ READ ONLY` 快照事务内完成，保全状态以读取时刻的同一
+快照为准），不生成修订、变化记录或断言，不改变任何保全；保全建立 / 解除与预检本身均不
+递增正式修订，正式批次的既有请求与返回格式均未改变。
 
 `resolution` 取值（HTTP 恒为 200；结构性拒绝仍为 4xx）：
 
@@ -374,6 +388,36 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 把 `extra_retractions` 作为额外的 `{"op": "retract", ...}` 并入原批次后再提交正式批次，
 即可通过核验（示例见 `examples/preflight_demo.sh`）。
+
+**与临时保全配合的本轮用法**：既有生效证据 `E1`（A 早于 B）已被生效保全 H1 覆盖，
+新证据 `E2` 拟断言 B 早于 A：
+
+```bash
+# 1) 建立保全（只冻结撤回入口，不递增修订；credential 仅此次返回）
+curl -s -X POST localhost:8000/evidence-holds -H 'Content-Type: application/json' -d '{
+  "expected_revision": 1, "evidence_ids": ["E1"], "reason": "交接复核冻结 E1"}'
+
+# 2) 预检：直接撤回受保全证据 -> 409 EVIDENCE_HELD，details 同正式批次
+curl -s -X POST localhost:8000/batches/preflight -H 'Content-Type: application/json' -d '{
+  "expected_revision": 1, "operations": [{"op": "retract", "evidence_id": "E1"}]}'
+# {"error": {"code": "EVIDENCE_HELD", ...,
+#   "details": {"blocked_evidence_ids": ["E1"],
+#               "blocked_evidence": [{"evidence_id": "E1", "holds": [{"id": 1, ...}]}]}}}
+
+# 3) 预检拟提交的新边 E2：唯一可拆环的旧证据 E1 受保全 -> budget_insufficient，
+#    不再给出照提交必被 EVIDENCE_HELD 拒绝的假阳性建议
+curl -s -X POST localhost:8000/batches/preflight -H 'Content-Type: application/json' -d '{
+  "expected_revision": 1, "extra_retraction_budget": 3, "operations": [
+    {"op": "assert", "evidence_id": "E2", "stratum_a": "B", "stratum_b": "A",
+     "relation": "earlier_than"}]}'
+# {"resolution": "budget_insufficient", "passed": false,
+#  "extra_retractions": [], "extra_retraction_count": null,
+#  "conflicts": [{"type": "earlier_cycle", "evidence_path": ["E1", "E2"], ...}]}
+
+# 4) 持凭据解除保全（不递增修订）后重新预检 -> extra_retractions_found: ["E1"]；
+#    再把该 retract 并入正式批次提交即可成功
+curl -s -X POST localhost:8000/evidence-holds/1/release -H 'Content-Type: application/json' -d '{"expected_revision": 1, "credential": "<一次性凭据>"}'
+```
 
 ### 野外终端离线整包汇入：`POST /field-packages`
 
@@ -951,7 +995,7 @@ bash examples/arrangement_demo.sh
 | 404 | `HOLD_NOT_FOUND` | 临时保全：保全记录不存在 |
 | 403 | `INVALID_HOLD_CREDENTIAL` | 临时保全：解除凭据错误 |
 | 409 | `HOLD_ALREADY_RELEASED` | 临时保全：保全已解除，重复解除拒绝 |
-| 409 | `EVIDENCE_HELD` | 普通批次撤回目标仍被生效临时保全覆盖（整批拒绝，details 给命中证据与保全记录） |
+| 409 | `EVIDENCE_HELD` | 普通批次或提交前预检的直接撤回目标仍被生效临时保全覆盖（整批/预检拒绝，details 给命中证据与保全记录；预检拒绝不写任何状态） |
 | 409 | `FIELD_PACKAGE_EVIDENCE_HELD` | 野外包勘误将撤回受保全覆盖的原包证据（整笔拒绝，台账/修订不变） |
 | 409 | `MERGE_EVIDENCE_HELD` | 推演并入将把受保全覆盖证据撤回到正式库（并入拒绝，正式与推演均不变） |
 
@@ -1358,7 +1402,8 @@ bash examples/arrangement_demo.sh
 ```
 
 提交前预检演示（原批可通过 / 建议最少撤回 / 预算不足附冲突路径 /
-新断言自成矛盾不可修复 / 拒绝语义沿用正式批次 / 全程只读）：
+新断言自成矛盾不可修复 / 受保全证据不进建议且直接撤回按 EVIDENCE_HELD 拒绝、
+解除后恢复可选 / 拒绝语义沿用正式批次 / 全程只读）：
 
 ```bash
 bash examples/preflight_demo.sh
@@ -1437,8 +1482,8 @@ app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
   field.py        # 野外终端离线整包汇入与勘误替换：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等、撤回替换链
-  holds.py        # 争议证据临时保全：一次性解除凭据（哈希存证）、生效保全来源查询、正式撤回三路径拦截、行锁同序裁决
-  preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
+  holds.py        # 争议证据临时保全：一次性解除凭据（哈希存证）、生效保全来源查询、正式撤回三路径拦截、只读视图受保证据查询、行锁同序裁决
+  preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3，排除受保全证据、直接撤回按 EVIDENCE_HELD 拒绝）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   reconciliation.py # 成果包交付前只读复核：封存结论/最优路径与当前结果逐项比较、首次偏离追溯
@@ -1453,7 +1498,7 @@ examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
   periodization_demo.sh # 分期骨架视图示例（等价组/平行合并/传递省略/过期拒绝/撤回重算）
   arrangement_demo.sh # 分期试排示例（最早/最晚界、锚点、三类不可行证据链、推演冻结视图）
-  preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/拒绝/只读校验）
+  preflight_demo.sh # 提交前只读预检示例（最少撤回/预算不足/新断言自相矛盾/受保全证据联动/拒绝/只读校验）
   resilience_demo.sh # 撤回承受力分析示例（最小割/字典序最小/受保护不可达/原关系未定/拒绝）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）

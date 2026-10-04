@@ -4,6 +4,8 @@
 # 预检只读：不生成修订、变化记录或断言，原状态不变。
 # 输入沿用正式批次的 expected_revision / operations，
 # 额外给出 extra_retraction_budget（0～3，默认可撤回的生效旧证据数上限）。
+# 受临时保全覆盖的证据：预检直接撤回按 409 EVIDENCE_HELD 拒绝（同正式批次），
+# 且不会出现在额外撤回建议中（保全解除后才可重新入选），见第 8 节。
 #
 # 前提：服务已启动（docker compose up --build），监听 http://localhost:8000
 set -euo pipefail
@@ -118,12 +120,72 @@ curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d
     {\"op\": \"assert\", \"evidence_id\": \"PN-9\", \"stratum_a\": \"A1\", \"stratum_b\": \"A2\", \"relation\": \"same_period\"}
   ]}" | pp
 
-echo; echo "== 8. 确认预检全程只读：修订号仍为 $REV，PN-* 证据均未入库 =="
+echo; echo "== 8. 临时保全联动（修复：预检不得把受保全旧证据列为额外撤回建议） =="
+echo "   正式视图中 PH-1 = H1 早于 H2（修订号随示例视图，当前 $REV）；先登记并提交该证据。"
+curl -s -X POST "$BASE/strata" -H 'Content-Type: application/json' \
+  -d '{"stratum_id": "H1", "site": "预检保全演示区"}' | pp
+curl -s -X POST "$BASE/strata" -H 'Content-Type: application/json' \
+  -d '{"stratum_id": "H2", "site": "预检保全演示区"}' | pp
+HOLD_REV_BEFORE="$(curl -s "$BASE/revision" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+if [ "$(curl -s "$BASE/assertions?status=active" | python3 -c 'import sys,json;print("PH-1" in {r["evidence_id"] for r in json.load(sys.stdin)})')" != "True" ]; then
+  curl -s -X POST "$BASE/batches" -H 'Content-Type: application/json' -d "{
+    \"expected_revision\": $HOLD_REV_BEFORE,
+    \"operations\": [
+      {\"op\": \"assert\", \"evidence_id\": \"PH-1\", \"stratum_a\": \"H1\", \"stratum_b\": \"H2\", \"relation\": \"earlier_than\"}
+    ]}" | pp
+fi
+REV="$(curl -s "$BASE/revision" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+echo "   （当前修订号 $REV）"
+
+echo; echo "-- 8a. 建立保全 PH-1（不递增修订），记下一次性解除凭据 --"
+HOLD_RESP="$(curl -s -X POST "$BASE/evidence-holds" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"evidence_ids\": [\"PH-1\"],
+  \"reason\": \"预检演示：交接复核期间冻结 PH-1\"}")"
+echo "$HOLD_RESP" | pp
+HOLD_ID="$(echo "$HOLD_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
+CREDENTIAL="$(echo "$HOLD_RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"])')"
+echo "   保全编号 $HOLD_ID；修订号仍为 $(curl -s "$BASE/revision" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+
+echo; echo "-- 8b. 预检直接撤回受保全的 PH-1 -> 409 EVIDENCE_HELD，blocked_evidence 与正式批次同构 --"
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"operations\": [
+    {\"op\": \"retract\", \"evidence_id\": \"PH-1\"}
+  ]}" | pp
+echo "   同一请求提交正式批次也是同样的 409 EVIDENCE_HELD（演示只读预检口径与正式一致）："
+curl -s -X POST "$BASE/batches" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"operations\": [
+    {\"op\": \"retract\", \"evidence_id\": \"PH-1\"}
+  ]}" | pp
+
+echo; echo "-- 8c. 新边 PH-2 = H2 早于 H1 与受保全的 PH-1 成环：预算内唯一旧证据 PH-1 受保全，"
+echo "    预检不得再建议撤回 PH-1（照做必被正式批次 EVIDENCE_HELD 拒绝）-> budget_insufficient 附冲突路径 --"
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"extra_retraction_budget\": 3,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"PH-2\", \"stratum_a\": \"H2\", \"stratum_b\": \"H1\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+
+echo; echo "-- 8d. 持凭据解除保全（仍不递增修订）后重新预检 -> 可建议 PH-1（extra_retractions_found） --"
+curl -s -X POST "$BASE/evidence-holds/$HOLD_ID/release" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"credential\": \"$CREDENTIAL\"}" | pp
+curl -s -X POST "$BASE/batches/preflight" -H 'Content-Type: application/json' -d "{
+  \"expected_revision\": $REV,
+  \"extra_retraction_budget\": 1,
+  \"operations\": [
+    {\"op\": \"assert\", \"evidence_id\": \"PH-2\", \"stratum_a\": \"H2\", \"stratum_b\": \"H1\", \"relation\": \"earlier_than\"}
+  ]}" | pp
+
+echo; echo "== 9. 确认预检全程只读：修订号仍为 $REV，PN-*/PH-2 证据均未入库 =="
 curl -s "$BASE/revision" | pp
 curl -s "$BASE/assertions?status=active" | python3 -c '
 import sys, json
 rows = json.load(sys.stdin)
-leaked = [r["evidence_id"] for r in rows if r["evidence_id"].startswith("PN-")]
+leaked = [r["evidence_id"] for r in rows if r["evidence_id"].startswith("PN-") or r["evidence_id"] == "PH-2"]
 print("active assertions:", [r["evidence_id"] for r in rows])
 print("leaked preflight evidence:", leaked)
 assert not leaked, leaked

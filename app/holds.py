@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence
 
 from .db import db_conn
 from .errors import ApiError
@@ -70,6 +70,20 @@ def _active_holds_map(cur, evidence_ids: Sequence[str]) -> Dict[str, List[Dict[s
     for evidence_id, *hold_row in cur.fetchall():
         result.setdefault(evidence_id, []).append(_hold_summary(hold_row))
     return result
+
+
+def active_held_evidence(cur, evidence_ids: Iterable[str]) -> FrozenSet[str]:
+    """只读视图中的“当前被生效保全覆盖”证据编号集合（供只读分析路径使用）。
+
+    与 :func:`assert_evidence_not_held` 走同一张表、同一条
+    `h.status = 'active'` 语义，但不抛错、不要求计数器行锁：预检等只读事务
+    在自己的快照内调用，得到读取时刻的保全状态；调用方据此排除候选或按
+    正式批次口径自行拒绝。传入编号为空时返回空集合。
+    """
+    ids = sorted({eid for eid in evidence_ids if eid})
+    if not ids:
+        return frozenset()
+    return frozenset(_active_holds_map(cur, ids))
 
 
 def assert_evidence_not_held(
